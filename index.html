@@ -201,6 +201,19 @@ mark{background:#FFE08A;color:#3B2A00;border-radius:3px;padding:0 2px}
 .fade{animation:fade .3s ease}
 @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+
+/* Supabase account and cloud-sync status */
+.cloudbar{max-width:720px;margin:10px auto 0;padding:0 16px}
+.cloudbox{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:11px 12px;box-shadow:var(--shadow)}
+.cloudtop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cloudstatus{font-size:12px;color:var(--muted);font-weight:650;flex:1;min-width:130px}
+.cloudstatus[data-state=ok]{color:var(--good)}.cloudstatus[data-state=err]{color:var(--bad)}
+.cloudactions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:9px}
+.cloudactions input{flex:1;min-width:160px;width:auto;min-height:40px;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:7px 10px}
+.cloudactions button{min-height:40px;border:1px solid var(--line);border-radius:10px;background:var(--surface2);padding:7px 11px;font-weight:650}
+.cloudactions button.primary{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
+.cloudhint{font-size:11px;color:var(--muted);margin-top:6px}
+
 </style>
 
 <div id="app">
@@ -212,6 +225,19 @@ mark{background:#FFE08A;color:#3B2A00;border-radius:3px;padding:0 2px}
     </div>
     <div class="pline"><span id="plab">0%</span><div class="bar"><i id="pbar"></i></div><span id="pcnt"></span></div>
   </div></header>
+  <section class="cloudbar" aria-label="Cloud account">
+    <div class="cloudbox">
+      <div class="cloudtop">
+        <strong style="font:700 14px var(--display)">☁ Cloud progress</strong>
+        <span class="cloudstatus" id="cloudStatus" data-state="idle">Not connected · saved on this device</span>
+      </div>
+      <div id="cloudControls" class="cloudactions">
+        <input id="cloudEmail" type="email" autocomplete="email" placeholder="Your invited email address" aria-label="Email address">
+        <button class="primary" id="cloudLogin" type="button">Send magic link</button>
+      </div>
+      <div class="cloudhint" id="cloudHint">Sign in to sync your study progress across devices. Your existing browser progress will be uploaded on your first login if no cloud backup exists.</div>
+    </div>
+  </section>
   <main class="wrap" id="view"></main>
 </div>
 <nav class="nav" id="nav" aria-label="Sections"></nav>
@@ -219,6 +245,7 @@ mark{background:#FFE08A;color:#3B2A00;border-radius:3px;padding:0 2px}
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <div class="conf" id="conf" aria-hidden="true"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
 'use strict';
@@ -244,7 +271,151 @@ const KEY='azurepath.v1';
 const def=()=>({theme:'auto',exam:'az104',date:'',obj:{},qs:{},fc:{},hist:[],mocks:[],days:{},open:{},ms:{}});
 let S=def(),memOnly=false;
 try{const r=localStorage.getItem(KEY);if(r)S=Object.assign(def(),JSON.parse(r))}catch(e){memOnly=true}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){memOnly=true}}
+
+/* ---------- optional Supabase cloud persistence ----------
+   Fill these three values after creating your Supabase project.
+   Keep the publishable/anon key here; NEVER put a service_role/secret key in this file.
+*/
+const SUPABASE_URL='YOUR_SUPABASE_PROJECT_URL';
+const SUPABASE_ANON_KEY='YOUR_SUPABASE_PUBLISHABLE_OR_ANON_KEY';
+const ALLOWED_EMAIL='YOUR_EMAIL@example.com'; // Personal-use sign-in allowlist
+const CLOUD_TABLE='user_progress';
+let supabase=null,cloudUser=null,cloudReady=false,cloudTimer=null,cloudBusy=false,cloudPending=false,cloudLoadingUid=null;
+function cloudConfigured(){
+  return SUPABASE_URL.startsWith('https://') &&
+    !SUPABASE_URL.includes('YOUR_SUPABASE') &&
+    SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.includes('YOUR_SUPABASE') &&
+    window.supabase && window.supabase.createClient;
+}
+function cloudStatus(message,state='idle'){
+  const el=document.getElementById('cloudStatus');
+  if(el){el.textContent=message;el.dataset.state=state}
+}
+function cloudHint(message){
+  const el=document.getElementById('cloudHint');if(el)el.textContent=message;
+}
+function renderCloudUI(){
+  const controls=document.getElementById('cloudControls');
+  if(!controls)return;
+  if(!cloudConfigured()){
+    controls.innerHTML='<span class="small muted">Cloud sync setup required — add your Supabase URL, publishable/anon key, and allowed email in this file.</span>';
+    cloudStatus('Setup required · local saving is active','idle');
+    cloudHint('Until Supabase is configured, progress continues to save in this browser.');
+    return;
+  }
+  if(cloudUser){
+    controls.innerHTML='<span class="small" style="flex:1;min-width:160px">Signed in as <b>'+esc(cloudUser.email||'your account')+'</b></span><button id="cloudSyncNow" type="button">Sync now</button><button id="cloudLogout" type="button">Sign out</button>';
+    cloudHint('Your progress is saved on this device and synced to your private cloud account.');
+  }else{
+    controls.innerHTML='<input id="cloudEmail" type="email" autocomplete="email" placeholder="Your invited email address" aria-label="Email address"><button class="primary" id="cloudLogin" type="button">Send magic link</button>';
+    cloudHint('Sign in to sync your study progress across devices. On your first login, existing browser progress is uploaded only if no cloud backup exists.');
+  }
+}
+function scheduleCloudSave(){
+  if(!cloudReady||!cloudUser||!supabase)return;
+  clearTimeout(cloudTimer);cloudTimer=setTimeout(pushCloudState,800);
+}
+async function pushCloudState(){
+  if(!cloudReady||!cloudUser||!supabase)return;
+  if(cloudBusy){cloudPending=true;return}
+  cloudBusy=true;cloudStatus('Syncing…','idle');
+  try{
+    const {error}=await supabase.from(CLOUD_TABLE).upsert({
+      user_id:cloudUser.id,state:S,updated_at:new Date().toISOString()
+    },{onConflict:'user_id'});
+    if(error)throw error;
+    cloudStatus('Synced · '+new Date().toLocaleTimeString(),'ok');
+  }catch(err){
+    console.error('Azure Path cloud save failed:',err);
+    cloudStatus('Cloud sync failed · local copy is safe','err');
+    cloudHint('Cloud error: '+(err.message||'Check your Supabase table, RLS policies, and internet connection.'));
+  }finally{
+    cloudBusy=false;
+    if(cloudPending){cloudPending=false;scheduleCloudSave()}
+  }
+}
+async function hydrateCloudSession(session){
+  if(!session||!session.user)return;
+  if(cloudUser&&cloudUser.id===session.user.id&&(cloudReady||cloudLoadingUid===session.user.id))return;
+  cloudReady=false;cloudUser=session.user;cloudLoadingUid=session.user.id;renderCloudUI();
+  cloudStatus('Loading your cloud progress…','idle');
+  try{
+    const localState=JSON.parse(JSON.stringify(S));
+    const {data,error}=await supabase.from(CLOUD_TABLE).select('state').eq('user_id',cloudUser.id).maybeSingle();
+    if(error)throw error;
+    if(data&&data.state&&typeof data.state==='object'){
+      S=Object.assign(def(),data.state);
+      try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){memOnly=true}
+      cloudStatus('Cloud progress loaded','ok');
+      cloudHint('Your latest saved progress has been restored from your private cloud account.');
+    }else{
+      // First-login migration: preserve the existing browser progress in the new cloud row.
+      S=Object.assign(def(),localState);
+      const {error:writeError}=await supabase.from(CLOUD_TABLE).upsert({
+        user_id:cloudUser.id,state:S,updated_at:new Date().toISOString()
+      },{onConflict:'user_id'});
+      if(writeError)throw writeError;
+      cloudStatus('First backup migrated to cloud','ok');
+      cloudHint('Your existing localStorage progress was copied to your cloud account. This browser copy remains as a backup.');
+    }
+    cloudReady=true;renderCloudUI();render();
+  }catch(err){
+    console.error('Azure Path cloud load failed:',err);
+    cloudReady=false;cloudStatus('Cloud load failed · local copy kept','err');
+    cloudHint('Could not load cloud progress: '+(err.message||'Check your Supabase setup. Your browser copy has not been erased.'));
+    renderCloudUI();
+  }finally{cloudLoadingUid=null}
+}
+async function initCloud(){
+  if(!cloudConfigured()){renderCloudUI();return}
+  try{
+    supabase=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY,{
+      auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+    });
+    supabase.auth.onAuthStateChange((event,session)=>{
+      if(event==='SIGNED_OUT'){cloudUser=null;cloudReady=false;cloudStatus('Signed out · saved on this device','idle');renderCloudUI();return}
+      if(session)setTimeout(()=>hydrateCloudSession(session),0);
+    });
+    const {data,error}=await supabase.auth.getSession();
+    if(error)throw error;
+    if(data.session)await hydrateCloudSession(data.session);
+    else{renderCloudUI();cloudStatus('Not signed in · saved on this device','idle')}
+  }catch(err){
+    console.error('Azure Path Supabase initialization failed:',err);
+    cloudStatus('Cloud setup error · local saving is active','err');
+    cloudHint(err.message||'Unable to initialize Supabase.');
+  }
+}
+async function sendCloudMagicLink(){
+  const email=(document.getElementById('cloudEmail')||{}).value.trim().toLowerCase();
+  if(!email){cloudStatus('Enter your email address','err');return}
+  if(!ALLOWED_EMAIL||ALLOWED_EMAIL.includes('YOUR_EMAIL')||email!==ALLOWED_EMAIL.toLowerCase()){
+    cloudStatus('This email is not on your personal allowlist','err');
+    cloudHint('Update ALLOWED_EMAIL in the HTML to the exact email address you invited in Supabase.');
+    return;
+  }
+  const btn=document.getElementById('cloudLogin');if(btn){btn.disabled=true;btn.textContent='Sending…'}
+  try{
+    const {error}=await supabase.auth.signInWithOtp({
+      email,
+      options:{emailRedirectTo:location.origin+location.pathname,shouldCreateUser:false}
+    });
+    if(error)throw error;
+    cloudStatus('Magic link sent · check your inbox','ok');
+    cloudHint('Open the sign-in email on this device, or open its link on the device where you want to use Azure Path.');
+  }catch(err){
+    cloudStatus('Could not send magic link','err');cloudHint(err.message||'Check Supabase Auth email settings.');
+  }finally{const b=document.getElementById('cloudLogin');if(b){b.disabled=false;b.textContent='Send magic link'}}
+}
+async function signOutCloud(){
+  if(!supabase)return;
+  const {error}=await supabase.auth.signOut();
+  if(error){cloudStatus('Sign out failed','err');cloudHint(error.message)}
+}
+function save(){
+  try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){memOnly=true}
+  scheduleCloudSave();
+}
 let tab=(location.hash||'#learn').slice(1);if(!TABS.some(t=>t[0]===tab))tab='learn';
 let Q='',WEAK=false;
 
@@ -520,7 +691,12 @@ document.addEventListener('input',e=>{if(e.target.id==='qs'){Q=e.target.value;$(
 document.addEventListener('toggle',e=>{const d=e.target;if(!d.matches||!d.matches('details[data-k]'))return;S.open[d.dataset.k]=d.open;save();
  if(d.classList.contains('topic')&&d.open){const b=$('.tb',d);if(b&&!b.firstChild)b.innerHTML=tbHTML(TOP[d.dataset.t])}},true);
 addEventListener('hashchange',()=>{const t=(location.hash||'#learn').slice(1);if(TABS.some(x=>x[0]===t)&&t!==tab){tab=t;render()}});
-applyTheme();render();
+applyTheme();render();renderCloudUI();initCloud();
+document.addEventListener('click',e=>{
+  if(e.target.closest('#cloudLogin'))sendCloudMagicLink();
+  else if(e.target.closest('#cloudLogout'))signOutCloud();
+  else if(e.target.closest('#cloudSyncNow'))pushCloudState();
+});
 })();
 </script>
 
